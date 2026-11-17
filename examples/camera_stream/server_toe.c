@@ -1,0 +1,1358 @@
+/*
+ * Copyright (c) 2026 WIZnet Co., Ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
+ * @file    server_toe.c
+ * @brief   HTTP + MJPEG server on the WIZnet hardware TCP/IP offload engine.
+ *
+ * Built only when NET_STACK_TOE is defined.
+ *
+ * All HTTP_SOCK_COUNT hardware sockets listen on HTTP_PORT. That is not a
+ * throughput choice: on this chip a listening socket *becomes* the connection
+ * when a client arrives, so a single listener could hold the MJPEG stream or
+ * the status poll but never both.
+ *
+ * Request path (Phase 1b, 2026-10-23):
+ *
+ *   socket ESTABLISHED
+ *     -> conn: TLS phase (HTTPS) / WAIT_REQ (plain)          http/conn.c
+ *     -> TLS handshake steps                                  tls/tls_server.c
+ *     -> request bytes, any split, into one pooled context   http/http_req.c
+ *     -> complete + validated request
+ *     -> route lookup (path, then method -> 404 / 405)
+ *     -> authorization hook (always allows in Phase 1)
+ *     -> handler -> response -> close, or -> STREAM
+ *
+ *   Every way a connection ends goes through conn_teardown(): response done,
+ *   parse error, timeout, TLS error, peer FIN/RST, stream takeover, send
+ *   failure. It is safe to call twice.
+ *
+ * Since 2026-11-05 (split step 1) the sockets, TLS steps, deadlines and
+ * connection diagnostics live in net/wiz_transport.c; this file reaches them
+ * through wt_* calls and the callbacks registered in net_server_init().
+ * Since split step 2 request intake, routing and the reply helpers live in
+ * net/http_server.c: handlers get an http_ctx_t, never a socket. The stream
+ * code below still keys on the socket number until step 3.
+ *
+ * What did not change: the MJPEG sender (push_stream_frame), the single-viewer
+ * takeover policy, Connection: close on every response, the TLS suites and
+ * tickets, and the stream diagnostics.
+ */
+
+#include "stream_config.h"
+#if defined(NET_STACK_TOE)
+
+#include <stdio.h>
+#include <string.h>
+
+#include "pico/stdlib.h"
+#include "pico/time.h"
+
+#include "net_server.h"
+#include "cam_state.h"
+#include "net_load.h"
+#include "cam_driver.h"
+#include "dvp_capture.h"
+#include "cam_pipeline.h"       /* frame buffers, and the control command slot */
+#include "settings.h"
+#if CAM_AUTH
+#include "session.h"
+#include "tls_server.h"
+#endif
+#include "web_page_gz.h"        /* generated from web/index.html */
+#include "hardware/watchdog.h"  /* reboot after the console factory reset */
+#if defined(STREAM_HTTPS)
+#include "tls_server.h"
+#endif
+#include "http_server.h"
+#include "wiz_transport.h"
+
+#define STREAM_STALL_MS     5000        /* stream frame: no progress -> drop    */
+/* How long one service of the stream socket may wait for TX space. Returning
+ * at the first full buffer left the link idle while the loop went round the
+ * other sockets: 38 ms per 47 KB frame, 26 fps at 1280x720 where the blocking
+ * sender made 30 (2026-10-27). */
+#define STREAM_SPIN_US      2000
+
+#if HTTP_SOCK_COUNT != WT_MAX_CONN
+#error "the transport serves exactly HTTP_SOCK_COUNT sockets"
+#endif
+
+
+/* -------------------------------- Variables ------------------------------- */
+static char    g_json[CAM_STATUS_JSON_MAX];
+
+/** Per-socket role. A socket becomes STREAM after answering GET /stream. */
+typedef enum {
+    SOCK_ROLE_HTTP = 0,
+    SOCK_ROLE_STREAM
+} sock_role_t;
+
+static sock_role_t g_role[HTTP_SOCK_COUNT];
+/* How often the stream socket was serviced - if this stops while the
+ * stream is open, the loop is not reaching push_stream_frame() at all. */
+uint32_t g_push_calls;
+static int8_t      g_stream_sn = -1;
+/* What the current stream actually carried, printed when it ends. When the
+ * page reopens because it drew nothing for 5 s (r=idle), "last sent N ms ago"
+ * says which side stopped: a few ms means the board was still delivering and
+ * the browser was not drawing; seconds means the board had stopped. */
+static uint32_t        g_stream_frames;
+static absolute_time_t g_stream_opened_at, g_stream_last_sent;
+
+/*
+ * The frame on its way to the stream socket. push_stream_frame() queues what
+ * the socket takes and returns; the next pass carries on from here. A viewer
+ * that reads slowly therefore costs the other sockets nothing - it used to hold
+ * core 0 for up to SEND_TIMEOUT_MS on every frame (2026-10-27). The pipeline
+ * buffer stays SENDING until the last byte is queued. The part head has its own
+ * buffer because the reply header buffer is shared with every response.
+ */
+typedef struct {
+    bool            busy;
+    uint8_t         sn;
+    uint8_t         part;           /* 0 part head, 1 JPEG, 2 closing CRLF  */
+    uint32_t        off;            /* bytes of this part already queued    */
+    uint16_t        head_len;
+    char            head[96];
+    const uint8_t  *jpeg;
+    uint32_t        jpeg_len;
+    absolute_time_t started, progress;
+#if STREAM_PIPELINE
+    cam_frame_t     fr;
+#endif
+} stream_tx_t;
+static stream_tx_t g_stx;
+
+static void stream_tx_drop(void)
+{
+    if (!g_stx.busy) {
+        return;
+    }
+#if STREAM_PIPELINE
+    cam_pipeline_release(&g_stx.fr);
+#endif
+    g_stx.busy = false;
+}
+
+static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
+
+#if CAM_AUTH
+/* ------------------------------ Login state -------------------------------- */
+static sess_table_t  g_sess;
+static auth_db_t     g_db;              /* copy of the saved accounts        */
+static uint64_t      g_setup_until;     /* setup mode open until (ms), 0 shut */
+static uint32_t      g_stream_owner;    /* session id streaming, 0 = none     */
+static auth_role_t   g_stream_role;
+
+static uint64_t now64(void) { return time_us_64() / 1000u; }
+static bool setup_open(void) { return g_setup_until && now64() < g_setup_until; }
+/* The caller's session, set by app_authorize() for this request only. */
+#define REQ_SESS(ctx) ((const sess_t *)(ctx)->auth)
+#endif
+static uint8_t  sock_idx(uint8_t sn) { return (uint8_t)(sn - SOCK_HTTP_BASE); }
+
+/* ------------------------------- TCP helpers ------------------------------- */
+/* The stream sender still speaks socket numbers until step 3. */
+static int32_t tcp_send_some(uint8_t sn, const uint8_t *buf, uint32_t len)
+{
+    return wt_send_some(sock_idx(sn), buf, len);
+}
+
+/** Status document, optionally as 409 so the page can say a value was clamped. */
+static int32_t send_status(http_ctx_t *ctx, bool refused)
+{
+    int n = cam_state_status_json(g_json, sizeof(g_json));
+    if (n < 0) {
+        return -1;
+    }
+    return http_reply(ctx, refused ? "409 Conflict" : "200 OK",
+                      "application/json", NULL, g_json, (uint32_t)n);
+}
+
+/* {"error":msg[,"control":name]} */
+static int32_t send_json_error(http_ctx_t *ctx, const char *status, const char *extra,
+                               const char *msg, const char *control)
+{
+    char detail[64];
+    if (control && control[0]) {
+        int n = snprintf(detail, sizeof(detail), "\"control\":\"%s\"", control);
+        if (n > 0 && (size_t)n < sizeof(detail)) {
+            return http_reply_json_error(ctx, status, extra, msg, detail);
+        }
+    }
+    return http_reply_json_error(ctx, status, extra, msg, NULL);
+}
+
+/* ------------------------------ Load generator ----------------------------- */
+/**
+ * Answer GET /load?kb=N with N KB of filler.
+ *
+ * Written a kilobyte at a time out of one constant block; the point is to
+ * occupy the link and the stack, not to move any particular bytes.
+ */
+static int32_t serve_load(http_ctx_t *ctx, const char *q, size_t qlen)
+{
+    uint32_t kb = net_load_parse_kb(q, qlen);
+    uint32_t i;
+
+    if (kb == 0) {
+        static const char none[] = "load=0";
+        return http_reply(ctx, "200 OK", "text/plain", NULL, none,
+                          (uint32_t)(sizeof(none) - 1));
+    }
+
+    if (http_reply_head(ctx, "200 OK", "application/octet-stream", NULL,
+                        kb * LOAD_CHUNK_SIZE) < 0) {
+        return -1;
+    }
+
+    for (i = 0; i < kb; i++) {
+        if (wt_send_all(ctx->conn, net_load_chunk(), LOAD_CHUNK_SIZE) < 0) {
+            return -1;
+        }
+        /* Account as it goes, so a load that is cut off halfway still reports
+           the half that was actually carried. */
+        net_load_account(LOAD_CHUNK_SIZE);
+    }
+    return 1;
+}
+
+/* --------------------------------- Stream ---------------------------------- */
+static void stream_summary(const char *what, uint8_t sn)
+{
+    absolute_time_t now = get_absolute_time();
+    uint32_t life_ms = (uint32_t)(absolute_time_diff_us(g_stream_opened_at, now) / 1000);
+    if (g_stream_frames == 0) {
+        printf("%s socket %u: 0 frames in %lu ms\n", what, sn, (unsigned long)life_ms);
+        return;
+    }
+    printf("%s socket %u: %lu frames in %lu ms, last sent %lu ms ago\n", what, sn,
+           (unsigned long)g_stream_frames, (unsigned long)life_ms,
+           (unsigned long)(absolute_time_diff_us(g_stream_last_sent, now) / 1000));
+}
+
+static void release_stream_socket(uint8_t sn)
+{
+    if (g_stx.busy && g_stx.sn == sn) {
+        stream_tx_drop();                 /* frame cut short: buffer back to core 1 */
+    }
+    g_role[sock_idx(sn)] = SOCK_ROLE_HTTP;
+    if (g_stream_sn == (int8_t)sn) {
+        g_stream_sn = -1;
+#if CAM_AUTH
+        g_stream_owner = 0;
+#endif
+        stream_summary("Stream closed on", sn);
+    }
+}
+
+/* ------------------------------ Connection end ----------------------------- */
+/* Close through the transport; on_closed() below then releases the stream.
+ * Idempotent, as before. */
+static void conn_teardown(uint8_t sn, wt_close_reason_t why)
+{
+    wt_close(sock_idx(sn), why);
+}
+
+/* --------------------------------- Stream ---------------------------------- */
+static int32_t begin_stream(http_ctx_t *ctx, const char *why, size_t why_len,
+                            const char *page, size_t page_len)
+{
+    uint8_t sn = (uint8_t)(SOCK_HTTP_BASE + ctx->conn);
+    static const char stream_hdr[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=" MJPEG_BOUNDARY "\r\n"
+        "Cache-Control: no-store\r\n"
+        "Pragma: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    /*
+     * Hand the camera to the newest request rather than refusing it. The page
+     * reopens the stream whenever the frame size changes or the link comes
+     * back, and the previous connection is often still half-open at that
+     * moment; refusing the new one would leave a dead picture on screen, which
+     * at an exhibition is the failure this whole build exists to avoid.
+     */
+#if CAM_AUTH
+    /*
+     * One viewer at a time (Q4): the same session reconnecting takes its own
+     * stream back - the old connection is usually half-open after a reload -
+     * an admin takes it from a viewer, and anyone else is refused while the
+     * current stream stays up.
+     */
+    const sess_t *rs = REQ_SESS(ctx);
+    if (g_stream_sn >= 0 && g_stream_sn != (int8_t)sn && rs) {
+        sess_stream_t p = sess_stream_policy(g_stream_owner, g_stream_role,
+                                             rs->id, rs->role);
+        if (p == SESS_STREAM_REFUSE) {
+            printf("Stream refused on socket %u: %s session %lu is watching\n", sn,
+                   auth_role_name(g_stream_role), (unsigned long)g_stream_owner);
+            static const char busy[] = "{\"error\":\"the stream is in use by another session\"}";
+            return http_reply(ctx, "409 Conflict", "application/json", "Retry-After: 10\r\n",
+                              busy, (uint32_t)(sizeof(busy) - 1));
+        }
+    }
+#endif
+    if (g_stream_sn >= 0 && g_stream_sn != (int8_t)sn) {
+        uint8_t old = (uint8_t)g_stream_sn;
+        printf("Stream taken over: socket %u -> %u (r=%.*s)\n", old, sn,
+               (int)why_len, why);
+        stream_summary("  old stream on", old);
+        g_role[sock_idx(old)] = SOCK_ROLE_HTTP;
+        g_stream_sn = -1;
+        conn_teardown(old, WT_CLOSE_TAKEOVER);
+    }
+
+    if (wt_send_all(ctx->conn, stream_hdr, (uint32_t)(sizeof(stream_hdr) - 1)) < 0) {
+        return -1;
+    }
+
+    g_role[sock_idx(sn)] = SOCK_ROLE_STREAM;
+    g_stream_sn = (int8_t)sn;
+#if CAM_AUTH
+    g_stream_owner = rs ? rs->id : 0;
+    g_stream_role  = rs ? rs->role : AUTH_NONE;
+#endif
+    g_stream_frames = 0;
+    g_stream_opened_at = get_absolute_time();
+    g_stream_last_sent = g_stream_opened_at;
+    wt_hold(sock_idx(sn));              /* request slot back to the pool */
+    if (page_len) {
+        printf("Stream opened on socket %u (r=%.*s, page: %.*s)\n", sn,
+               (int)why_len, why, (int)page_len, page);
+    } else {
+        printf("Stream opened on socket %u (r=%.*s)\n", sn, (int)why_len, why);
+    }
+    cam_state_note_stream_open(why, why_len);
+    return 1;
+}
+
+/* Next frame into g_stx. 1 = a frame is ready to go, 0 = nothing to send. */
+static int32_t stream_tx_next(uint8_t sn)
+{
+    if (!cam_state_streaming()) {
+        cam_state_metrics_update();      /* keep the window honest while idle */
+        return 0;
+    }
+
+#if STREAM_PIPELINE
+    /* Core 1 captured it already. Nothing new yet means go and serve the
+     * other sockets instead of waiting for VSYNC here. */
+    static absolute_time_t s_last_sent, s_last_stall_log;
+    if (!cam_pipeline_take(&g_stx.fr)) {
+        cam_state_metrics_update();
+        /* Nothing new for 3 s on an open stream: say what the buffers hold,
+         * every 5 s, so a freeze explains itself in the console. */
+        if (absolute_time_diff_us(s_last_sent, get_absolute_time()) > 3000000 &&
+            absolute_time_diff_us(s_last_stall_log, get_absolute_time()) > 5000000) {
+            char d[200];
+            cam_pipeline_debug(d, sizeof(d));
+            printf("[pipe] s%u no new frame for 3 s: %s push_calls=%lu\n", sn, d,
+                   (unsigned long)g_push_calls);
+            s_last_stall_log = get_absolute_time();
+        }
+        return 0;
+    }
+    s_last_sent = get_absolute_time();
+    g_stx.busy     = true;
+    g_stx.jpeg     = g_stx.fr.data;
+    g_stx.jpeg_len = g_stx.fr.len;
+#else
+    int crc = cam_capture_frame();
+    if (crc == -5) {
+        cam_state_note_too_big();
+        return 0;
+    }
+    if (crc != 0) {
+        if (cam_state_note_capture_fail()) {
+            printf("No frames for %u attempts - sensor recovered\n",
+                   FAIL_STREAK_RECOVER);
+        }
+        return 0;
+    }
+    cam_state_note_capture_ok();
+
+    /* A truncated capture would desync the multipart parser - skip it. */
+    if (camera.frame_length < 2 || image_buff[0] != 0xFF || image_buff[1] != 0xD8) {
+        cam_state_note_dropped();
+        return 0;
+    }
+    g_stx.busy     = true;
+    g_stx.jpeg     = image_buff;
+    g_stx.jpeg_len = camera.frame_length;
+#endif
+
+    int n = snprintf(g_stx.head, sizeof(g_stx.head),
+                     "--" MJPEG_BOUNDARY "\r\n"
+                     "Content-Type: image/jpeg\r\n"
+                     "Content-Length: %lu\r\n"
+                     "\r\n",
+                     (unsigned long)g_stx.jpeg_len);
+    if (n <= 0 || n >= (int)sizeof(g_stx.head)) {
+        stream_tx_drop();
+        return -1;
+    }
+    g_stx.sn       = sn;
+    g_stx.head_len = (uint16_t)n;
+    g_stx.part     = 0;
+    g_stx.off      = 0;
+    g_stx.started  = get_absolute_time();
+    g_stx.progress = g_stx.started;
+    return 1;
+}
+
+/**
+ * Service the stream socket once: queue what fits of the frame in flight, or
+ * start the next one. Returns without waiting for the client; negative only
+ * when the stream has to end (connection gone, or no progress for
+ * STREAM_STALL_MS - a frozen tab, not a slow one).
+ */
+static int32_t push_stream_frame(uint8_t sn)
+{
+#if STREAM_PIPELINE
+    g_push_calls++;
+#endif
+    if (!g_stx.busy) {
+        int32_t r = stream_tx_next(sn);
+        if (r <= 0) {
+            return (r < 0) ? -1 : 1;
+        }
+    }
+
+    uint64_t t_enter = time_us_64();
+    while (g_stx.part <= 2) {
+        const uint8_t *p;
+        uint32_t       len;
+        if (g_stx.part == 0) {
+            p = (const uint8_t *)g_stx.head; len = g_stx.head_len;
+        } else if (g_stx.part == 1) {
+            p = g_stx.jpeg;                  len = g_stx.jpeg_len;
+        } else {
+            p = (const uint8_t *)"\r\n";     len = 2;
+        }
+
+        /* The same remaining bytes go back after a short count - mbedTLS
+         * may hold half a record (tls_send_some). */
+        int32_t r = tcp_send_some(sn, p + g_stx.off, len - g_stx.off);
+        if (r < 0) {
+            stream_tx_drop();
+            return -1;
+        }
+        if (r > 0) {
+            g_stx.off     += (uint32_t)r;
+            g_stx.progress = get_absolute_time();
+        }
+        if (g_stx.off < len) {
+            if (time_us_64() - t_enter < STREAM_SPIN_US) {
+                continue;                    /* space usually frees within this */
+            }
+            if (absolute_time_diff_us(g_stx.progress, get_absolute_time()) >
+                (int64_t)STREAM_STALL_MS * 1000) {
+                printf("Stream on socket %u: client took nothing for %u ms - dropped\n",
+                       sn, (unsigned)STREAM_STALL_MS);
+                stream_tx_drop();
+                return -1;
+            }
+            return 1;                        /* the rest on a later pass */
+        }
+        g_stx.part++;
+        g_stx.off = 0;
+    }
+
+    /* Whole frame queued. */
+    uint32_t        jpeg_size = g_stx.jpeg_len;
+    absolute_time_t started   = g_stx.started;
+    stream_tx_drop();
+    g_stream_frames++;
+    g_stream_last_sent = get_absolute_time();
+    cam_state_note_frame(
+        (uint64_t)absolute_time_diff_us(started, g_stream_last_sent),
+        jpeg_size);
+    cam_state_metrics_update();
+
+    return 1;
+}
+
+/* --------------------------------- Handlers -------------------------------- */
+/*
+ * Handlers receive a request that is complete and has passed the parser's
+ * policy. Path matching and query decoding are done once, before them: the
+ * path is percent-decoded by the parser and every query value comes out of
+ * http_query_get(). No handler parses text of its own.
+ */
+/*
+ * The page is gzip'd at build time (tools/page_gz.py) and sent as stored: a
+ * third of the bytes on the wire, through TLS and in flash, and nothing to do
+ * per request. There is no plain copy to fall back to. Every browser takes
+ * gzip, and a request with no Accept-Encoding accepts any coding (RFC 9110
+ * 12.5.3).
+ */
+static int32_t h_index(http_ctx_t *ctx)
+{
+    return http_reply(ctx, "200 OK", "text/html; charset=utf-8",
+                              "Content-Encoding: gzip\r\n",
+                              (const char *)HTTP_INDEX_PAGE_GZ,
+                              (uint32_t)sizeof(HTTP_INDEX_PAGE_GZ));
+}
+
+/* The page tags each open: /stream?<counter>&r=<why>&p=<drawn>,<ms since last>. */
+static int32_t h_stream(http_ctx_t *ctx)
+{
+    char why[16], page[32];
+    size_t why_len  = http_query(ctx, "r", why, sizeof(why));
+    size_t page_len = http_query(ctx, "p", page, sizeof(page));
+    return begin_stream(ctx, why, why_len, page, page_len);
+}
+
+static int32_t h_load(http_ctx_t *ctx)
+{
+    size_t qlen;
+    const uint8_t *q = http_req_query(ctx->req, &qlen);
+    return serve_load(ctx, (const char *)q, qlen);
+}
+
+static int32_t h_start(http_ctx_t *ctx)
+{
+    cam_state_set_streaming(true);
+    printf("Streaming STARTED\n");
+    return send_status(ctx, false);
+}
+
+static int32_t h_stop(http_ctx_t *ctx)
+{
+    cam_state_set_streaming(false);
+    printf("Streaming STOPPED\n");
+    return send_status(ctx, false);
+}
+
+static int32_t h_status(http_ctx_t *ctx)
+{
+    return send_status(ctx, false);
+}
+
+static int32_t h_reset(http_ctx_t *ctx)
+{
+    cam_state_recover();
+    return send_status(ctx, false);
+}
+
+/* ------------------------------ Snapshot (2d) ------------------------------ */
+/*
+ * GET /snapshot.jpg - one JPEG. Streaming or not, the streaming flag and the
+ * stream's frame rate are left alone: while the stream runs, the frame comes
+ * out of the capture buffer it is already in; while it is stopped, core 1
+ * captures one frame for this request. No frame within 2.5 s is 504.
+ *
+ * Core 0 waits here, like a control write does, so the other sockets are not
+ * served until the frame is out.
+ */
+static int32_t h_snapshot(http_ctx_t *ctx)
+{
+    uint32_t t0 = now_ms();
+#if STREAM_PIPELINE
+    cam_frame_t fr;
+    bool fresh = false;
+    if (!cam_pipeline_snapshot_hold(&fr, CAM_SNAPSHOT_TIMEOUT_MS, &fresh)) {
+        printf("[snap] no frame within %u ms (%s)\n", (unsigned)CAM_SNAPSHOT_TIMEOUT_MS,
+               cam_state_streaming() ? "streaming" : "stopped");
+        return http_reply_error(ctx, 504, NULL);
+    }
+    uint32_t waited = now_ms() - t0;
+    int32_t rc = http_reply(ctx, "200 OK", "image/jpeg", NULL, fr.data, fr.len);
+    cam_pipeline_snapshot_release(&fr);
+    printf("[snap] %lu B seq %lu (%s) waited %lu ms, sent in %lu ms\n",
+           (unsigned long)fr.len, (unsigned long)fr.seq,
+           fresh ? "captured for it" : "latest", (unsigned long)waited,
+           (unsigned long)(now_ms() - t0 - waited));
+    return rc;
+#else
+    /* Sequential build: capture on this core, into the one buffer - which a
+     * stream frame may still be going out of. */
+    if (g_stx.busy) {
+        return http_reply_error(ctx, 503, "Retry-After: 1\r\n");
+    }
+    int cap = cam_capture_frame();
+    uint32_t len = camera.frame_length;
+    if (cap != 0 || now_ms() - t0 > CAM_SNAPSHOT_TIMEOUT_MS) {
+        printf("[snap] no frame (rc %d, %lu ms)\n", cap, (unsigned long)(now_ms() - t0));
+        return http_reply_error(ctx, 504, NULL);
+    }
+    if (len < 2 || image_buff[0] != 0xFF || image_buff[1] != 0xD8) {
+        return http_reply_error(ctx, 504, NULL);
+    }
+    return http_reply(ctx, "200 OK", "image/jpeg", NULL, (const char *)image_buff, len);
+#endif
+}
+
+/* --------------------------- Camera controls (2c) --------------------------- */
+/*
+ * GET /api/controls - what the driver offers, for the page to build its panel.
+ * An empty list means the driver offers none (OV2640 until the new PCB).
+ */
+static int32_t h_controls(http_ctx_t *ctx)
+{
+    unsigned cnt = 0;
+    const cam_ctrl_desc_t *t = cam_sensor_controls(&cnt);
+    size_t used = 0, cap = sizeof(g_json);
+    int n = snprintf(g_json, cap, "[");
+    used = (size_t)n;
+
+    for (unsigned i = 0; t && i < cnt; i++) {
+        const cam_ctrl_desc_t *d = &t[i];
+        const char *type = d->type == CAM_CTRL_BOOL ? "bool"
+                         : d->type == CAM_CTRL_ENUM ? "enum" : "int";
+        n = snprintf(g_json + used, cap - used,
+                     "%s{\"name\":\"%s\",\"label\":\"%s\",\"group\":\"Camera\","
+                     "\"type\":\"%s\",\"min\":%d,\"max\":%d,\"provisional\":%s",
+                     i ? "," : "", d->name, d->label, type, d->min, d->max,
+                     (d->flags & CAM_CTRL_F_PROVISIONAL) ? "true" : "false");
+        if (n < 0 || (size_t)n >= cap - used) goto overflow;
+        used += (size_t)n;
+        if (d->type == CAM_CTRL_ENUM && d->enum_names) {
+            n = snprintf(g_json + used, cap - used, ",\"options\":[");
+            if (n < 0 || (size_t)n >= cap - used) goto overflow;
+            used += (size_t)n;
+            for (int k = 0; k <= d->max; k++) {
+                n = snprintf(g_json + used, cap - used, "%s\"%s\"", k ? "," : "",
+                             d->enum_names[k]);
+                if (n < 0 || (size_t)n >= cap - used) goto overflow;
+                used += (size_t)n;
+            }
+            n = snprintf(g_json + used, cap - used, "]");
+            if (n < 0 || (size_t)n >= cap - used) goto overflow;
+            used += (size_t)n;
+        }
+        n = snprintf(g_json + used, cap - used, "}");
+        if (n < 0 || (size_t)n >= cap - used) goto overflow;
+        used += (size_t)n;
+    }
+    n = snprintf(g_json + used, cap - used, "]");
+    if (n < 0 || (size_t)n >= cap - used) goto overflow;
+    used += (size_t)n;
+    return http_reply(ctx, "200 OK", "application/json", NULL, g_json, (uint32_t)used);
+
+overflow:
+    printf("[ctrl] /api/controls does not fit in %u bytes\n", (unsigned)cap);
+    return http_reply_error(ctx, 500, NULL);
+}
+
+/*
+ * POST /api/cam   Content-Type: application/x-www-form-urlencoded
+ *                 body: brightness=3&flip=1
+ *
+ *   200  every control written -> status document (ctrl = written values)
+ *   400  unknown control, bad value, out of range, duplicate - nothing written
+ *   415  not form-urlencoded
+ *   502  a write failed: the controls before it were written, the rest not
+ *   503  the previous command is still in the slot (Retry-After: 1)
+ *   504  core 1 did not finish in time (withdrawn, or outcome unknown)
+ *
+ * Values are refused, never clamped; a write is reported as written, never as
+ * a value read back from the sensor.
+ */
+static int32_t h_cam(http_ctx_t *ctx)
+{
+    if (!http_is_form(ctx)) {
+        return send_json_error(ctx, "415 Unsupported Media Type", NULL,
+                               "use application/x-www-form-urlencoded", NULL);
+    }
+
+    unsigned cnt = 0;
+    const cam_ctrl_desc_t *t = cam_sensor_controls(&cnt);
+    size_t blen = 0;
+    const uint8_t *body = http_req_body(ctx->req, &blen);
+    cam_ctrl_batch_t b;
+    char bad[CAM_CTRL_NAME_MAX + 1];
+    cam_ctrl_err_t e = cam_ctrl_parse_form(body, blen, t, cnt, &b, bad, sizeof(bad));
+    if (e != CAM_CTRL_OK) {
+        /* the name came from the request: keep only safe JSON characters */
+        for (char *c = bad; *c; c++) {
+            if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_')) *c = '?';
+        }
+        printf("[ctrl] refused: %s (%s)\n", cam_ctrl_err_name(e), bad);
+        return send_json_error(ctx, "400 Bad Request", NULL, cam_ctrl_err_name(e), bad);
+    }
+
+    cam_ctrl_result_t res = { 0, -1, 0 };
+    cam_cmd_rc_t rc = cam_pipeline_set_controls(&b, &res, CAM_CMD_TIMEOUT_MS);
+    switch (rc) {
+    case CAM_CMD_OK:
+        for (unsigned i = 0; i < b.n; i++) {
+            printf("[ctrl] %s = %d written\n", t[b.item[i].idx].name, b.item[i].value);
+        }
+        return send_status(ctx, false);
+    case CAM_CMD_FAILED: {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "write failed; %u written before it", (unsigned)res.n_ok);
+        return send_json_error(ctx, "502 Bad Gateway", NULL, msg,
+                               t[b.item[res.failed_at].idx].name);
+    }
+    case CAM_CMD_BUSY:
+        return send_json_error(ctx, "503 Service Unavailable", "Retry-After: 1\r\n",
+                               cam_cmd_rc_name(rc), NULL);
+    case CAM_CMD_TIMEOUT_NOT_RUN:
+    case CAM_CMD_TIMEOUT_RUNNING:
+    default:
+        return send_json_error(ctx, "504 Gateway Timeout", NULL, cam_cmd_rc_name(rc), NULL);
+    }
+}
+
+/*
+ * POST /api/settings/save - keep the current frame size and the written
+ * control values across a reboot. Saving is the only way anything reaches
+ * flash. The body is ignored. Core 0 is held for the erase and program.
+ */
+static int32_t h_settings_save(http_ctx_t *ctx)
+{
+    char why[64];
+    uint32_t ms = 0;
+    if (settings_save_current(why, sizeof(why), &ms) != 0) {
+        return send_json_error(ctx, "500 Internal Server Error", NULL, why, NULL);
+    }
+    return send_status(ctx, false);
+}
+
+#if defined(STREAM_HTTPS)
+#include "mbedtls/pkcs5.h"
+/*
+ * GET /api/diag/pbkdf2?n=<iterations> - time one PBKDF2-HMAC-SHA256 on this
+ * core, to pick the stored-password iteration count from a measurement
+ * (Phase 3b). Core 0 is held for the duration.
+ */
+static int32_t h_diag_pbkdf2(http_ctx_t *ctx)
+{
+    char v[8];
+    size_t vn = http_query(ctx, "n", v, sizeof(v));
+    uint32_t n = 0;
+    for (size_t i = 0; i < vn; i++) {
+        if (v[i] < '0' || v[i] > '9') { n = 0; break; }
+        n = n * 10u + (uint32_t)(v[i] - '0');
+    }
+    if (n == 0 || n > 200000u) {
+        return http_reply_error(ctx, 400, NULL);
+    }
+    static const uint8_t salt[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    uint8_t out[32];
+    absolute_time_t t0 = get_absolute_time();
+    int rc = mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const uint8_t *)"benchmark", 9,
+                                           salt, sizeof(salt), n, sizeof(out), out);
+    uint32_t us = (uint32_t)absolute_time_diff_us(t0, get_absolute_time());
+    printf("[auth] PBKDF2-SHA256 %lu iterations: %lu ms (rc %d)\n",
+           (unsigned long)n, (unsigned long)(us / 1000), rc);
+    int k = snprintf(g_json, sizeof(g_json), "{\"iterations\":%lu,\"us\":%lu,\"rc\":%d}",
+                     (unsigned long)n, (unsigned long)us, rc);
+    return http_reply(ctx, "200 OK", "application/json", NULL, g_json, (uint32_t)k);
+}
+#endif
+
+#if CAM_AUTH
+/* ------------------------------- Login (3b) -------------------------------- */
+#define SID_COOKIE_ATTR "; Path=/; Secure; HttpOnly; SameSite=Strict"
+
+static void wipe(void *p, size_t n)
+{
+    volatile uint8_t *v = p;
+    while (n--) *v++ = 0;
+}
+
+/* {"provisioned":..,"setup_open":..,"role":..,"user":..,"csrf":..,"viewer":{..}} */
+static int auth_json(const sess_t *s, char *buf, size_t cap)
+{
+    char csrf[SESS_HEX_LEN + 1] = "";
+    const char *user = "";
+    if (s) {
+        sess_hex(s->csrf, csrf);
+        user = g_db.acct[s->role == AUTH_ADMIN ? 0 : 1].user;
+    }
+    int n = snprintf(buf, cap,
+                     "{\"provisioned\":%s,\"setup_open\":%s,\"setup_serial\":%s,\"role\":\"%s\","
+                     "\"user\":\"%s\",\"csrf\":\"%s\"",
+                     auth_provisioned(&g_db) ? "true" : "false", setup_open() ? "true" : "false",
+                     CAM_SETUP_SERIAL ? "true" : "false",
+                     auth_role_name(s ? s->role : AUTH_NONE), user, csrf);
+    if (n < 0 || (size_t)n >= cap) return -1;
+    size_t used = (size_t)n;
+    if (s && s->role == AUTH_ADMIN) {
+        n = snprintf(buf + used, cap - used, ",\"viewer\":{\"present\":%s,\"enabled\":%s,\"user\":\"%s\"}",
+                     g_db.acct[1].present ? "true" : "false",
+                     g_db.acct[1].enabled ? "true" : "false", g_db.acct[1].user);
+        if (n < 0 || (size_t)n >= cap - used) return -1;
+        used += (size_t)n;
+    }
+    n = snprintf(buf + used, cap - used, "}");
+    if (n < 0 || (size_t)n >= cap - used) return -1;
+    return (int)(used + (size_t)n);
+}
+
+/* A new session for @p role, answered with its cookie and the auth document. */
+static int32_t start_session(http_ctx_t *ctx, auth_role_t role)
+{
+    uint8_t rnd[2 * SESS_TOKEN_LEN];
+    if (tls_random(rnd, sizeof(rnd)) != 0) {
+        return send_json_error(ctx, "500 Internal Server Error", NULL, "no randomness", NULL);
+    }
+    const sess_t *s = sess_create(&g_sess, role, rnd, now64());
+    wipe(rnd, sizeof(rnd));
+    char tok[SESS_HEX_LEN + 1], cookie[128];
+    sess_hex(s->token, tok);
+    snprintf(cookie, sizeof(cookie), "Set-Cookie: " SESS_COOKIE "=%s" SID_COOKIE_ATTR "; Max-Age=%lu\r\n",
+             tok, (unsigned long)(SESS_ABS_MS / 1000u));
+    wipe(tok, sizeof(tok));
+    int n = auth_json(s, g_json, sizeof(g_json));
+    int32_t rc = http_reply(ctx, "200 OK", "application/json", cookie, g_json, (uint32_t)n);
+    wipe(cookie, sizeof(cookie));
+    return rc;
+}
+
+/* GET /api/auth - who is this, and does the device need setting up. Public:
+ * the page asks before it knows whether it is logged in. */
+static int32_t h_auth(http_ctx_t *ctx)
+{
+    size_t clen = 0;
+    const char *ck = (const char *)http_req_header(ctx->req, HTTP_H_COOKIE, &clen);
+    const sess_t *s = sess_lookup(&g_sess, ck, clen, now64(), true);
+    int n = auth_json(s, g_json, sizeof(g_json));
+    return http_reply(ctx, "200 OK", "application/json", NULL, g_json, (uint32_t)n);
+}
+
+/* POST /api/login  user=..&pass=.. */
+static int32_t h_login(http_ctx_t *ctx)
+{
+    if (!auth_provisioned(&g_db)) {
+        return send_json_error(ctx, "403 Forbidden", NULL, "setup required", NULL);
+    }
+    uint32_t retry = 0;
+    if (!sess_login_allowed(&g_sess, now64(), &retry)) {
+        char ra[32];
+        snprintf(ra, sizeof(ra), "Retry-After: %lu\r\n", (unsigned long)((retry + 999u) / 1000u));
+        return send_json_error(ctx, "429 Too Many Requests", ra, "too many failed logins; wait", NULL);
+    }
+    char user[AUTH_USER_MAX + 2], pass[AUTH_PASS_MAX + 2];
+    size_t ul = http_form(ctx, "user", user, sizeof(user));
+    size_t pl = http_form(ctx, "pass", pass, sizeof(pass));
+    absolute_time_t t0 = get_absolute_time();
+    auth_role_t role = auth_verify(&g_db, user, ul, pass, pl);
+    wipe(pass, sizeof(pass));
+    sess_login_result(&g_sess, role != AUTH_NONE, now64());
+    printf("[auth] login '%s': %s (%lu ms)\n", role != AUTH_NONE ? user : "?",
+           role != AUTH_NONE ? auth_role_name(role) : "refused",
+           (unsigned long)(absolute_time_diff_us(t0, get_absolute_time()) / 1000));
+    if (role == AUTH_NONE) {
+        return send_json_error(ctx, "401 Unauthorized", NULL, "wrong user name or password", NULL);
+    }
+    return start_session(ctx, role);
+}
+
+/* POST /api/logout */
+static int32_t h_logout(http_ctx_t *ctx)
+{
+    uint32_t id = REQ_SESS(ctx)->id;
+    sess_end(&g_sess, id);
+    if (g_stream_owner == id && g_stream_sn >= 0) {
+        conn_teardown((uint8_t)g_stream_sn, WT_CLOSE_TAKEOVER);
+    }
+    static const char ok[] = "{\"ok\":true}";
+    return http_reply(ctx, "200 OK", "application/json",
+                              "Set-Cookie: " SESS_COOKIE "=" SID_COOKIE_ATTR "; Max-Age=0\r\n",
+                              ok, (uint32_t)(sizeof(ok) - 1));
+}
+
+/* Salt, set, save; g_db only changes when the save succeeded. */
+static int set_account(auth_role_t role, const char *user, size_t ul, const char *pass, size_t pl,
+                       char *why, size_t why_cap)
+{
+    auth_db_t db = g_db;
+    uint8_t salt[AUTH_SALT_LEN];
+    if (tls_random(salt, sizeof(salt)) != 0) {
+        snprintf(why, why_cap, "no randomness");
+        return -1;
+    }
+    auth_err_t e = auth_set(&db, role, user, ul, pass, pl, salt, AUTH_ITER_DEFAULT);
+    if (e != AUTH_OK) {
+        snprintf(why, why_cap, "%s", auth_err_name(e));
+        return -1;
+    }
+    uint32_t ms = 0;
+    if (settings_save_auth(&db, why, why_cap, &ms) != 0) {
+        return -1;
+    }
+    g_db = db;
+    wipe(&db, sizeof(db));
+    return 0;
+}
+
+/* POST /api/setup  user=..&pass=..  - only while setup mode is open and no
+ * admin exists. Creates the admin and logs it in. */
+static int32_t h_setup(http_ctx_t *ctx)
+{
+    if (auth_provisioned(&g_db)) {
+        return send_json_error(ctx, "409 Conflict", NULL, "already set up", NULL);
+    }
+    if (!setup_open()) {
+        return send_json_error(ctx, "403 Forbidden", NULL, "setup mode is not open", NULL);
+    }
+    char user[AUTH_USER_MAX + 2], pass[AUTH_PASS_MAX + 2], why[64];
+    size_t ul = http_form(ctx, "user", user, sizeof(user));
+    size_t pl = http_form(ctx, "pass", pass, sizeof(pass));
+    int rc = set_account(AUTH_ADMIN, user, ul, pass, pl, why, sizeof(why));
+    wipe(pass, sizeof(pass));
+    if (rc != 0) {
+        return send_json_error(ctx, "400 Bad Request", NULL, why, NULL);
+    }
+    g_setup_until = 0;
+    printf("[auth] admin '%s' created; setup mode closed\n", user);
+    return start_session(ctx, AUTH_ADMIN);
+}
+
+/* End every session of @p role except @p keep. */
+static void end_role_except(auth_role_t role, uint32_t keep)
+{
+    for (unsigned i = 0; i < SESS_MAX; i++) {
+        if (g_sess.s[i].used && g_sess.s[i].role == role && g_sess.s[i].id != keep) {
+            sess_end(&g_sess, g_sess.s[i].id);
+        }
+    }
+}
+
+/*
+ * POST /api/account (admin)
+ *   role=admin&old=..&pass=..[&user=..]   change the admin password (old required)
+ *   role=viewer&user=..&pass=..           set the viewer
+ *   role=viewer&enabled=0|1               switch the viewer off/on
+ * Sessions of the changed account end; the admin's own session stays.
+ */
+static int32_t h_account(http_ctx_t *ctx)
+{
+    char role_s[8], user[AUTH_USER_MAX + 2], pass[AUTH_PASS_MAX + 2], old[AUTH_PASS_MAX + 2];
+    char en[4], why[64];
+    http_form(ctx, "role", role_s, sizeof(role_s));
+    size_t ul = http_form(ctx, "user", user, sizeof(user));
+    size_t pl = http_form(ctx, "pass", pass, sizeof(pass));
+    size_t ol = http_form(ctx, "old", old, sizeof(old));
+    size_t el = http_form(ctx, "enabled", en, sizeof(en));
+    int rc = -1;
+    uint32_t me = REQ_SESS(ctx)->id;
+
+    if (strcmp(role_s, "admin") == 0) {
+        const char *name = ul ? user : g_db.acct[0].user;
+        size_t nl = ul ? ul : strlen(g_db.acct[0].user);
+        if (auth_verify(&g_db, g_db.acct[0].user, strlen(g_db.acct[0].user), old, ol) != AUTH_ADMIN) {
+            snprintf(why, sizeof(why), "current password is wrong");
+        } else {
+            rc = set_account(AUTH_ADMIN, name, nl, pass, pl, why, sizeof(why));
+            if (rc == 0) end_role_except(AUTH_ADMIN, me);
+        }
+    } else if (strcmp(role_s, "viewer") == 0 && el && !pl) {
+        if (!g_db.acct[1].present) {
+            snprintf(why, sizeof(why), "no viewer account");
+        } else {
+            auth_db_t db = g_db;
+            uint32_t ms;
+            auth_viewer_enable(&db, en[0] == '1');
+            rc = settings_save_auth(&db, why, sizeof(why), &ms);
+            if (rc == 0) {
+                g_db = db;
+                if (!db.acct[1].enabled) sess_end_role(&g_sess, AUTH_VIEWER);
+            }
+        }
+    } else if (strcmp(role_s, "viewer") == 0) {
+        rc = set_account(AUTH_VIEWER, user, ul, pass, pl, why, sizeof(why));
+        if (rc == 0) sess_end_role(&g_sess, AUTH_VIEWER);
+    } else {
+        snprintf(why, sizeof(why), "role must be admin or viewer");
+    }
+    wipe(pass, sizeof(pass));
+    wipe(old, sizeof(old));
+    if (rc != 0) {
+        return send_json_error(ctx, "400 Bad Request", NULL, why, NULL);
+    }
+    printf("[auth] account %s updated\n", role_s);
+    int n = auth_json(REQ_SESS(ctx), g_json, sizeof(g_json));
+    return http_reply(ctx, "200 OK", "application/json", NULL, g_json, (uint32_t)n);
+}
+#endif /* CAM_AUTH */
+
+/* /api/res?v=<WxH> */
+static int32_t h_res(http_ctx_t *ctx)
+{
+    char v[16];
+    size_t n = http_query(ctx, "v", v, sizeof(v));
+    res_t res;
+    if (n && cam_state_res_parse(v, n, &res)) {
+        cam_state_apply_resolution(res);
+    }
+    return send_status(ctx, false);
+}
+
+/*
+ * /api/clk?div=<n>&pll=<n>
+ *
+ * Sweep the sensor clock dividers without reflashing. Frame rate is set
+ * almost entirely by how fast the sensor emits a frame, so this is the knob
+ * worth searching. Diagnostic.
+ */
+static int32_t h_clk(http_ctx_t *ctx)
+{
+    uint8_t div, pll;
+    if (http_query_u8(ctx, "div", &div) && http_query_u8(ctx, "pll", &pll)) {
+#if STREAM_PIPELINE
+        cam_pipeline_pause();         /* core 1 off the sensor first */
+#endif
+        cam_set_clock_div(div, pll);
+#if STREAM_PIPELINE
+        cam_pipeline_resume();
+#endif
+        cam_state_metrics_reset();
+    }
+    return send_status(ctx, false);
+}
+
+#if CAM_QB_DIAG
+/*
+ * GET /api/diag/reg?a=<addr>[&v=<value>]   diagnostic image only
+ *
+ *   a   register, hex: 0x012A or 012A (0x0122-0x0134 only)
+ *   v   value to write, hex 0x32 or decimal 50; leave out to just read
+ *
+ * Answers what was there before, what was written and what reads back. The
+ * picture and frame size are for the person running the test to judge.
+ */
+int cam_qb_diag_reg(uint16_t reg, bool do_write, uint8_t val,
+                    uint8_t *before, uint8_t *after);
+
+static bool parse_num(const char *s, size_t n, bool hex_default, uint32_t max, uint32_t *out)
+{
+    bool hex = hex_default;
+    if (n > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        hex = true;
+        s += 2;
+        n -= 2;
+    }
+    if (n == 0 || n > 5) return false;
+    uint32_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        uint32_t d;
+        if (c >= '0' && c <= '9')                d = (uint32_t)(c - '0');
+        else if (hex && c >= 'a' && c <= 'f')    d = (uint32_t)(c - 'a' + 10);
+        else if (hex && c >= 'A' && c <= 'F')    d = (uint32_t)(c - 'A' + 10);
+        else return false;
+        v = v * (hex ? 16u : 10u) + d;
+    }
+    if (v > max) return false;
+    *out = v;
+    return true;
+}
+
+static int32_t h_diag_reg(http_ctx_t *ctx)
+{
+    char a[16], v[16], body[160];
+    size_t an = http_query(ctx, "a", a, sizeof(a));
+    size_t vn = http_query(ctx, "v", v, sizeof(v));
+    uint32_t reg, val = 0;
+
+    if (!parse_num(a, an, true, 0xFFFF, &reg) ||
+        (vn && !parse_num(v, vn, false, 0xFF, &val))) {
+        static const char msg[] = "use /api/diag/reg?a=0x012A to read, "
+                                  "/api/diag/reg?a=0x012A&v=0x32 to write\n";
+        return http_reply(ctx, "400 Bad Request", "text/plain", NULL, msg,
+                             (uint32_t)(sizeof(msg) - 1));
+    }
+
+    uint8_t before = 0, after = 0;
+#if STREAM_PIPELINE
+    cam_pipeline_pause();               /* core 1 off the sensor first */
+#endif
+    int rc = cam_qb_diag_reg((uint16_t)reg, vn != 0, (uint8_t)val, &before, &after);
+#if STREAM_PIPELINE
+    cam_pipeline_resume();
+#endif
+
+    int n;
+    if (rc == -1) {
+        n = snprintf(body, sizeof(body),
+                     "{\"error\":\"0x%04lX is outside 0x0122-0x0134\"}", (unsigned long)reg);
+        return http_reply(ctx, "400 Bad Request", "application/json", NULL, body, (uint32_t)n);
+    }
+    if (rc != 0) {
+        n = snprintf(body, sizeof(body),
+                     "{\"error\":\"SCCB failed on 0x%04lX\"}", (unsigned long)reg);
+        return http_reply(ctx, "502 Bad Gateway", "application/json", NULL, body, (uint32_t)n);
+    }
+    if (vn) {
+        n = snprintf(body, sizeof(body),
+                     "{\"reg\":\"0x%04lX\",\"before\":\"0x%02X\",\"wrote\":\"0x%02lX\","
+                     "\"read_back\":\"0x%02X\"}",
+                     (unsigned long)reg, before, (unsigned long)val, after);
+    } else {
+        n = snprintf(body, sizeof(body), "{\"reg\":\"0x%04lX\",\"value\":\"0x%02X\"}",
+                     (unsigned long)reg, after);
+    }
+    return http_reply(ctx, "200 OK", "application/json", NULL, body, (uint32_t)n);
+}
+#endif /* CAM_QB_DIAG */
+
+/* --------------------------------- Routing --------------------------------- */
+/*
+ * Access class, for the authorization hook that later phases fill in. Phase 1
+ * records it and allows everything; the point of having it now is that no
+ * route can be added without saying which class it belongs to, and that the
+ * check sits in one place in front of every handler.
+ */
+typedef enum {
+    ROUTE_PUBLIC = 0,   /* page shell and its assets                          */
+    ROUTE_VIEW,         /* watching: stream, status, control list             */
+    ROUTE_ADMIN,        /* changes camera state                               */
+    ROUTE_DIAG,         /* bench diagnostics, off in a product build          */
+} route_access_t;
+
+/* Existing endpoints and the query shapes the page sends, all GET. */
+static const http_route_t g_routes[] = {
+    { "/",             HTTP_M_GET, ROUTE_PUBLIC, h_index    },
+    { "/index.html",   HTTP_M_GET, ROUTE_PUBLIC, h_index    },
+    { "/stream",       HTTP_M_GET, ROUTE_VIEW,   h_stream   },
+    { "/snapshot.jpg", HTTP_M_GET, ROUTE_VIEW,   h_snapshot },
+    { "/api/status",   HTTP_M_GET, ROUTE_VIEW,   h_status   },
+    { "/api/controls", HTTP_M_GET, ROUTE_VIEW,   h_controls },
+    /* State changes are POST (Q1): with a session, a POST also needs the
+     * X-CSRF-Token header. The frame size still rides in the query. */
+    { "/api/start",    HTTP_M_POST, ROUTE_ADMIN, h_start    },
+    { "/api/stop",     HTTP_M_POST, ROUTE_ADMIN, h_stop     },
+    { "/api/reset",    HTTP_M_POST, ROUTE_ADMIN, h_reset    },
+    { "/api/res",      HTTP_M_POST, ROUTE_ADMIN, h_res      },
+#if CAM_AUTH
+    { "/api/auth",     HTTP_M_GET, ROUTE_PUBLIC, h_auth     },
+    { "/api/login",    HTTP_M_POST, ROUTE_PUBLIC, h_login   },
+    { "/api/setup",    HTTP_M_POST, ROUTE_PUBLIC, h_setup   },
+    { "/api/logout",   HTTP_M_POST, ROUTE_VIEW,  h_logout   },
+    { "/api/account",  HTTP_M_POST, ROUTE_ADMIN, h_account  },
+#endif
+    { "/api/cam",      HTTP_M_POST, ROUTE_ADMIN, h_cam      },
+    { "/api/settings/save", HTTP_M_POST, ROUTE_ADMIN, h_settings_save },
+    { "/api/clk",      HTTP_M_GET, ROUTE_DIAG,   h_clk      },
+    { "/load",         HTTP_M_GET, ROUTE_DIAG,   h_load     },
+#if defined(STREAM_HTTPS)
+    { "/api/diag/pbkdf2", HTTP_M_GET, ROUTE_DIAG, h_diag_pbkdf2 },
+#endif
+#if CAM_QB_DIAG
+    { "/api/diag/reg", HTTP_M_GET, ROUTE_DIAG,   h_diag_reg },
+#endif
+};
+
+static const http_route_table_t g_route_table = {
+    g_routes, sizeof(g_routes) / sizeof(g_routes[0])
+};
+
+/* 0 to serve, else the status code; *why for the JSON body. Sets ctx->auth to
+ * the caller's session (or NULL) for the handler. */
+static int app_authorize(void *app, const http_route_t *rt, http_ctx_t *ctx, const char **why)
+{
+    (void)app;
+#if CAM_AUTH
+    static const sess_need_t need[] = {
+        [ROUTE_PUBLIC] = SESS_NEED_NONE, [ROUTE_VIEW] = SESS_NEED_VIEWER,
+        [ROUTE_ADMIN] = SESS_NEED_ADMIN, [ROUTE_DIAG] = SESS_NEED_ADMIN,
+    };
+    size_t clen = 0, xlen = 0;
+    const char *ck = (const char *)http_req_header(ctx->req, HTTP_H_COOKIE, &clen);
+    const char *x  = (const char *)http_req_header(ctx->req, HTTP_H_CSRF, &xlen);
+    const sess_t *s = sess_lookup(&g_sess, ck, clen, now64(), true);
+    ctx->auth = s;
+    bool post = http_req_method(ctx->req) == HTTP_METHOD_POST;
+    return sess_policy(need[rt->access], auth_provisioned(&g_db), s, post,
+                       sess_csrf_ok(s, x, xlen), why);
+#else
+    (void)rt;
+    (void)ctx;
+    *why = "ok";
+    return 0;
+#endif
+}
+
+/* ---------------------------- Transport callbacks --------------------------- */
+static void on_hold(void *user, wt_conn_t c)
+{
+    (void)user;
+    if (push_stream_frame((uint8_t)(SOCK_HTTP_BASE + c)) < 0) {
+        wt_close(c, WT_CLOSE_SEND);
+    }
+}
+
+static void on_closed(void *user, wt_conn_t c, wt_close_reason_t why)
+{
+    (void)user;
+    (void)why;
+    release_stream_socket((uint8_t)(SOCK_HTTP_BASE + c));
+}
+
+/* --------------------------------- Public ---------------------------------- */
+int net_server_status_json(char *buf, size_t cap)
+{
+    return wt_status_json(buf, cap);
+}
+
+static const wt_config_t g_wt_cfg = {
+    .mac  = NET_MAC_ADDR,
+    .ip   = NET_IP_ADDR,
+    .mask = NET_SUBNET_MASK,
+    .gw   = NET_GATEWAY,
+    .dns  = NET_DNS_ADDR,
+    .port = HTTP_PORT,
+    .first_socket = SOCK_HTTP_BASE,
+#if defined(STREAM_HTTPS)
+    .tls  = true,
+#else
+    .tls  = false,
+#endif
+};
+
+void net_server_init(void)
+{
+    uint8_t i;
+
+    static const http_server_config_t http_cfg = {
+        .tables       = &g_route_table,
+        .n_tables     = 1,
+        .authorize    = app_authorize,
+        .app          = NULL,
+        .log_requests = EXHIBITION_HTTP_LOG,
+    };
+    wt_handlers_t h;
+    http_server_init(&http_cfg, &h);
+    h.on_hold   = on_hold;              /* the MJPEG stream holds connections */
+    h.on_closed = on_closed;
+
+    sleep_ms(3000);
+
+    if (!wt_init(&g_wt_cfg, &h)) {
+        printf("[net] transport init failed - no connections will be served\n");
+    }
+    for (i = 0; i < HTTP_SOCK_COUNT; i++) {
+        g_role[i] = SOCK_ROLE_HTTP;
+    }
+    settings_print();               /* USB serial is usually attached by now */
+#if CAM_AUTH
+    sess_init(&g_sess);
+    g_db = *settings_auth();
+    if (auth_provisioned(&g_db)) {
+        printf("[auth] admin '%s'%s; login required\n", g_db.acct[0].user,
+               g_db.acct[1].present ? (g_db.acct[1].enabled ? ", viewer on" : ", viewer off") : "");
+    } else {
+        printf("[auth] NO ADMIN ACCOUNT - only the login page answers.\n"
+#if CAM_SETUP_SERIAL
+               "[auth] type 'setup' + Enter on this console to open setup mode for 5 minutes\n"
+#else
+               "[auth] this image cannot open setup mode (no button on this PCB, and\n"
+               "[auth] CAM_SETUP_SERIAL is off): flash an image built with it ON to\n"
+               "[auth] create the admin, then flash this one again\n"
+#endif
+               );
+    }
+#if CAM_SETUP_SERIAL
+    printf("[auth] console: 'factory-reset' erases the accounts and camera settings\n");
+#endif
+#endif
+
+    printf("HTTP camera server ready (" STACK_NAME ", %u listeners, %u request contexts)\n",
+           (unsigned)HTTP_SOCK_COUNT, (unsigned)WT_MAX_REQUEST_SLOTS);
+#if defined(STREAM_HTTPS)
+    printf("Open https://%d.%d.%d.%d/ in a browser (trust the demo CA first)\n",
+#else
+    printf("Open http://%d.%d.%d.%d/ in a browser\n",
+#endif
+           g_wt_cfg.ip[0], g_wt_cfg.ip[1],
+           g_wt_cfg.ip[2], g_wt_cfg.ip[3]);
+}
+
+#if CAM_AUTH
+/*
+ * Once a second: a stream whose session ended (expired, logged out elsewhere,
+ * password changed) is closed - a long-lived connection must not outlive
+ * the login that opened it. And the setup-mode console.
+ */
+static void auth_housekeeping(void)
+{
+    static uint32_t last;
+    uint32_t t = now_ms();
+#if CAM_SETUP_SERIAL
+    /* Development build only: no button on this PCB yet (Q3/Q8 ask for a
+     * physical one). On the USB console:
+     *   setup          open setup mode, when there is no admin yet
+     *   factory-reset  then "yes" within 10 s: erase accounts and camera
+     *                  settings, reboot as a new board
+     * Whatever opens these later (a button, something else) calls the same
+     * two actions; only this trigger is development-only. */
+    static char line[16];
+    static uint8_t len;
+    static uint32_t reset_armed;        /* now_ms() of 'factory-reset', 0 = not */
+    int c;
+    while ((c = getchar_timeout_us(0)) >= 0) {
+        if (c == '\r' || c == '\n') {
+            if (len == 0) {
+                continue;               /* the \n of a \r\n, or a bare Enter:
+                                         * not a line, so it must not cancel
+                                         * a pending 'factory-reset' */
+            }
+            line[len] = 0;
+            bool armed = reset_armed && now_ms() - reset_armed < 10000u;
+            reset_armed = 0;            /* any other line ends the confirmation */
+            if (strcmp(line, "setup") == 0) {
+                if (auth_provisioned(&g_db)) {
+                    printf("[auth] already set up - setup mode not opened\n");
+                } else {
+                    g_setup_until = now64() + 5u * 60u * 1000u;
+                    printf("[auth] setup mode OPEN for 5 minutes - create the admin in the browser\n");
+                }
+            } else if (strcmp(line, "factory-reset") == 0) {
+                reset_armed = now_ms() | 1u;
+                printf("[reset] this erases the accounts and the camera settings, then reboots.\n"
+                       "[reset] type 'yes' + Enter within 10 s to go ahead\n");
+            } else if (strcmp(line, "yes") == 0 && armed) {
+                char why[48];
+                uint32_t ms;
+                if (settings_factory_reset(why, sizeof(why), &ms) == 0) {
+                    printf("[reset] done - rebooting as a new board (no admin, sensor defaults)\n");
+                    sleep_ms(100);      /* let the USB console drain */
+                    watchdog_reboot(0, 0, 0);
+                    for (;;) {
+                        tight_loop_contents();
+                    }
+                }
+                printf("[reset] FAILED: %s - reboot and check whether the admin is still there\n", why);
+            } else if (armed || strcmp(line, "yes") == 0) {
+                printf("[reset] not confirmed - nothing erased\n");
+            }
+            len = 0;
+        } else if (len + 1u < sizeof(line)) {
+            line[len++] = (char)c;
+        }
+    }
+#endif
+    if (t - last < 1000u) {
+        return;
+    }
+    last = t;
+    if (g_stream_owner && g_stream_sn >= 0 && !sess_alive(&g_sess, g_stream_owner, now64())) {
+        printf("[auth] session %lu ended - closing its stream\n", (unsigned long)g_stream_owner);
+        conn_teardown((uint8_t)g_stream_sn, WT_CLOSE_TAKEOVER);
+    }
+    if (g_setup_until && now64() >= g_setup_until) {
+        g_setup_until = 0;
+        printf("[auth] setup mode closed (timeout)\n");
+    }
+}
+#endif
+
+void net_server_service(void)
+{
+    wt_service();
+#if CAM_AUTH
+    auth_housekeeping();
+#endif
+}
+
+#endif /* NET_STACK_TOE */

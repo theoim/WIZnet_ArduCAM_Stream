@@ -1,0 +1,26 @@
+# CMake build tree
+build/
+cmake-build-*/
+build*/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Python viewer
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Generated certificates and keys (never commit)
+examples/camera_stream/tls/https_cert.c
+examples/camera_stream/tls_bench/bench_cert.c
+
+# Build logs
+build*.log
