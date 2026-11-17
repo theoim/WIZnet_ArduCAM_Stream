@@ -14,6 +14,7 @@ A script logs in, reads `/stream` for 30 s and counts complete JPEG frames.
 | B0554 | 1280x720 | Release, 1.0.0 | 907 | **30.15** | 24.8 KB | 6.2 Mbps | 0 |
 | B0554 | 1280x720 | Release | 905 | 30.16 | 24.1 KB | 6.0 Mbps | 0 |
 | B0554 | 1280x720 | Debug | 906 | 30.16 | 24.2 KB | 6.0 Mbps | 0 |
+| OV2640 | 800x600 | Release, 1.0.0 | 523 | **17.28** | 12.8 KB | 1.8 Mbps | 0 |
 | OV2640 | 800x600 | Release | — | 17.28 | — | — | 0 |
 | OV2640 | 800x600 | Debug | — | 17.28 | — | — | 0 |
 
@@ -24,11 +25,11 @@ The board reports per frame how long it waits for the frame to start
 | Camera | vsync_ms | read_ms | send_ms |
 |---|---|---|---|
 | B0554 1280x720 | 10 | 22 | 10 |
-| OV2640 800x600 | — | 47 | 6 |
+| OV2640 800x600 | 10 | 47 | 5 |
 
 Core 1 captures the next frame into a second buffer while core 0 sends the
 last one, so the frame period is the longer of reading and sending, not
-their sum. Sending takes 6–10 ms, less than reading on both cameras.
+their sum. Sending takes 5–10 ms, less than reading on both cameras.
 
 The B0554 delivers 30 frames per second at 720p and the board keeps every
 one. The OV2640 takes 47 ms to clock out one 800x600 frame, so it cannot go
@@ -45,10 +46,10 @@ malformed requests, login, roles, CSRF, session and lockout.
 | Camera | Firmware | Result |
 |---|---|---|
 | B0554 | 1.0.0 Release | **88/88**, three runs in a row |
-| OV2640 | before the listen fix below | 88/88 |
+| OV2640 | 1.0.0 Release | **88/88**, three runs in a row |
 
 Memory in use did not change across a run (272,320 of 532,480 bytes of SRAM
-before and after).
+before and after on the B0554, 272,328 on the OV2640).
 
 ### Found during this test: lost connections
 
@@ -64,8 +65,8 @@ gets a reset (ioLibrary issue #127).
 
 **What was done:** `net/wiz_transport.c` arms listeners with its own
 `wt_listen()`, which counts SYNRECV and ESTABLISHED as success and never
-closes the socket. Before the fix 0 of 5 runs passed; after it, 3 of 3. The
-OV2640 has not been re-run with the fix yet.
+closes the socket. On the B0554, 0 of 5 runs passed before the fix and 4 of 4
+after it; the OV2640 passed 3 of 3 after it.
 
 ## TLS
 
