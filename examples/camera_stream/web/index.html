@@ -259,6 +259,11 @@ input[type=range]{flex:1;min-width:90px;accent-color:var(--accent)}
    whole screen - so on a short screen it is the height that binds and the
    frame sits in a black box with bars either side. The box is black, so the
    bars read as the edge of the screen rather than as empty page. --------- */
+/* Not painted on the full page: the sensor clock sweep (a bring-up tool -
+   a wrong divider breaks the picture) and the second resolution picker
+   (the Control card has one). Both stay in the markup and the script. The
+   kiosk layout below shows the resolution bar again. */
+#sec-sweep,#sec-res{display:none}
 /* @if EXHIBITION_SIMPLE_UI */
 /* One screen, laid out top to bottom: header, picture, graphs. The picture
    is the flexible row, so it absorbs the slack and nothing else has to be
@@ -313,7 +318,7 @@ body.show-ctrls #sec-acct{display:block}
 /* Three rows now: picture takes the slack, bar and graphs take what they
    need. The bar is a bare strip, not a card - it reads as part of the
    picture frame rather than as another panel. */
-#sec-res{padding:0;border:0;background:transparent;box-shadow:none}
+#sec-res{display:block;padding:0;border:0;background:transparent;box-shadow:none}
 .resbar{display:flex;align-items:center;justify-content:center;gap:10px}
 .resbar label{margin:0;font-size:13px}
 .resbar select{width:auto;min-width:200px;font-size:15px}
@@ -376,7 +381,7 @@ canvas{height:110px}
 <body>
 <header>
   <div class='logo' id='brand'>Camera Stream</div>
-  <div class='sub'>ArduCAM MEGA &middot; <b id='addr'></b></div>
+  <div class='sub'>WIZnet ArduCAM Stream &middot; <b id='addr'></b></div>
   <div class='stackbox'>
     <div class='what' id='what'>&nbsp;</div>
     <div class='tag' id='stack'>&nbsp;</div>
@@ -1026,7 +1031,7 @@ function hint(s){
       ' the sensor mode.'}
   if(s.read_ms>=s.send_ms){
     return 'Bottleneck: <b>sensor readout</b>. Pixel data takes the longest to'+
-      ' pull out; the sensor clock below is the lever.'}
+      ' pull out, so the camera sets the frame rate, not the network.'}
   return 'Bottleneck: <b>network send</b>. Pushing the JPEG out takes the'+
     ' longest - this is where a hardwired stack and a software stack differ.';
 }
